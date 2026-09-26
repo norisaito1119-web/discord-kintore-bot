@@ -215,6 +215,38 @@ async def sync_level_role(member, level):
         return "error"
     return "ok"
 
+#[X1b]レベルに応じて「絵文字解放」ロールを付け外しし、カスタム絵文字の使用ロールにも反映する
+#  member = そのサーバーでのメンバー / level = 今のレベル
+#  戻り値: "ok" / "no_permission"(ロール権限が無い) / "error" / None(サーバーの外)
+EMOJI_UNLOCK_ROLE_NAME = "絵文字解放"
+EMOJI_UNLOCK_LEVEL = 5          # このレベルに到達したら解放
+EMOJI_UNLOCK_EMOJI_NAME = "saki1"   # 解放するカスタム絵文字の名前(サーバーにアップロード済みのもの)
+
+async def sync_emoji_unlock_role(member, level):
+    guild = getattr(member, "guild", None)
+    if guild is None:
+        return None
+    if not guild.me.guild_permissions.manage_roles:
+        return "no_permission"
+    try:
+        role = discord.utils.get(guild.roles, name=EMOJI_UNLOCK_ROLE_NAME)   # 既にあるロールを名前で探す
+        if role is None:                                                     # 無ければ作る
+            role = await guild.create_role(name=EMOJI_UNLOCK_ROLE_NAME, reason="絵文字解放ロール")
+        unlocked = level >= EMOJI_UNLOCK_LEVEL
+        if unlocked and role not in member.roles:
+            await member.add_roles(role, reason="レベル到達で絵文字解放")
+        elif not unlocked and role in member.roles:
+            await member.remove_roles(role, reason="レベル不足で絵文字を再ロック")
+        # カスタム絵文字の「使えるロール」に、このロールを設定しておく(絵文字ごとに1回設定すれば以後は自動)
+        if guild.me.guild_permissions.manage_emojis_and_stickers:
+            emoji = discord.utils.get(guild.emojis, name=EMOJI_UNLOCK_EMOJI_NAME)
+            if emoji is not None and role not in emoji.roles:
+                await emoji.edit(roles=[role], reason="絵文字解放ロールに紐づけ")
+    except discord.HTTPException as e:
+        print(f"[emoji-unlock] ERROR: {e!r}", flush=True)
+        return "error"
+    return "ok"
+
 #[X2]ロールをBotのロールのすぐ下まで持ち上げる
 #  名前の色は「一番上にあるロール」の色になる。新しく作ったロールは一番下に置かれるので、そのままだと後から作った称号の色が、
 #  先に作った部位マスターの色に負けてしまう。称号ロールを上に置いておくことで、称号の色が名前に出るようにしている
@@ -402,6 +434,7 @@ async def shared_kintore(user_id,record_list,member=None):
             result = await sync_level_role(member, new_lv)     # 称号ロールを付け替える(既に合っていれば、何もしない)
             if result == "no_permission" and new_badge is not None and new_badge != old_badge:
                 xp_text += "（名前の色の称号ロールを自動で付けるには、Botに「ロールの管理」権限が必要です）\n"
+            await sync_emoji_unlock_role(member, new_lv)       # レベルに応じて絵文字解放ロールも更新
 
 #勲章: 今回の記録で条件を満たした勲章があれば知らせる。部位マスターはサーバーのロールも付ける
     badge_text = ""
@@ -1098,6 +1131,7 @@ async def send_profile(message):
     result = await sync_level_role(message.author, lv)      # 称号ロールを今のレベルに合わせておく(権限を付けた直後の反映にもなる)
     if result == "no_permission" and badge:
         lines.append("※ 名前の色の称号ロールを自動で付けるには、Botに「ロールの管理」権限が必要です")
+    await sync_emoji_unlock_role(message.author, lv)         # 絵文字解放ロールも合わせておく
     await message.channel.send("\n".join(lines))
 
 #[B2]勲章コレクションの画面 (コマンド: b または 勲章)
@@ -1147,6 +1181,7 @@ async def grant_xp(user_id, gain, reason, member):
         note += f" {new_badge[1]}「{new_badge[2]}」獲得！"
     if member is not None:
         await sync_level_role(member, new_lv)
+        await sync_emoji_unlock_role(member, new_lv)
     return note
 
 #画面の文章: 残り回数 + これまでに押した結果(1回目から順に)。全部押し終わったら合計
@@ -1517,6 +1552,42 @@ HELP_TEXT = f"""📖 **使い方**
 
 `h` または `?` … この説明"""
 
+#⭐️【テスト】②サイコロアニメーション
+#  メッセージを短い間隔で書き換えて、回転してるように見せてから結果を確定する
+DICE_FACES = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]   # 1〜6の目のユニコード文字
+
+async def roll_dice(message):
+    msg = await message.channel.send("🎲 サイコロを振っています…")
+    for _ in range(5):                              # 5回、ランダムな目に書き換えて「回転」演出
+        await asyncio.sleep(0.3)
+        fake = random.choice(DICE_FACES)
+        await msg.edit(content=f"🎲 {fake}")
+    await asyncio.sleep(0.3)
+    result = random.randint(1, 6)
+    await msg.edit(content=f"🎲 出た目: {DICE_FACES[result - 1]}（{result}）")
+
+#⭐️レベルに応じた絵文字解放の一覧表示
+#  実際のロール制限(sync_emoji_unlock_role)は一覧からの表示/非表示で反映される。ここではLvに応じて🔒が外れる様子をテキストで見せる
+EMOJI_UNLOCKS = [
+    (1, "😀", "スマイル"),
+    (5, "<:saki1:1552447083292663808>", "ファイア"),
+    (5, "💎", "ダイヤ"),
+    (10, "👑", "クラウン"),
+]
+
+async def send_emoji_unlock_demo(message):
+    uid = message.author.id
+    ensure_xp_backfill(uid)
+    xp = db.get_total_xp(uid)
+    lv = level_from_xp(xp)
+    lines = [f"あなたは Lv.{lv} です\n"]
+    for need_lv, emoji, name in EMOJI_UNLOCKS:
+        if lv >= need_lv:
+            lines.append(f"{emoji} {name} ── 解放済み(Lv.{need_lv}〜)")
+        else:
+            lines.append(f"🔒 {name} ── Lv.{need_lv}で解放（あと{need_lv - lv}）")
+    await message.channel.send("\n".join(lines))
+
 @client.event
 async def on_message(message):
     if message.author == client.user: # Bot自身のメッセージには反応しない（無限ループ防止）
@@ -1619,5 +1690,13 @@ async def on_message(message):
         plt.close() # 描いたグラフを閉じてメモリを解放（Botはずっと動き続けるプログラムなので、閉じ忘れるとメモリが溜まっていく）
 
         await message.channel.send(file=discord.File("graph.png"))
+
+    #⭐️---【テスト】サイコロ---
+    elif content_lower.strip() in ("サイコロ", "dice"):
+        await roll_dice(message)
+
+    #⭐️---絵文字解放(レベルに応じて🔒が外れる一覧)---
+    elif content_lower.strip() in ("絵文字", "emoji"):
+        await send_emoji_unlock_demo(message)
 
 client.run(TOKEN)
