@@ -153,6 +153,23 @@ def get_growth_data(user_id):
         data.setdefault(exercise, []).append((d, weight))   # setdefault = キーが無ければ空リストを作ってから、それを返す(辞書のグループ化の定番)
     return data
 
+#[M7-3]「同じ重量が続いているか」を調べる用: その種目の「日ごとの最大重量」を、新しい日から順に limit 日ぶん返す
+#  before_date より前の記録だけを見る(今日の記録は呼び出し側で別に持っているので含めない)
+#  戻り値: [55.0, 55.0] のような重量のリスト(新しい日が先頭)
+def get_recent_day_weights(user_id, exercise, before_date, limit):
+    cone = sqlite3.connect("kintore.db")
+    cur = cone.cursor()
+    cur.execute("""
+        SELECT MAX(weight) FROM kintores
+        WHERE user_id = ? AND exercise = ? AND created_at < ?
+        GROUP BY substr(created_at, 1, 10)
+        ORDER BY substr(created_at, 1, 10) DESC
+        LIMIT ?
+    """, (user_id, exercise, before_date, limit))
+    rows = cur.fetchall()
+    cone.close()
+    return [row[0] for row in rows]
+
 #[M8-1]経験値(XP)を増やす。amount=増える量 / reason=内訳の文章(例: "種目50・来た日20") / 記録は1回ごとに1行ずつ残す(履歴として見返せる)
 def add_xp(user_id, amount, reason, created_at):
     cone = sqlite3.connect("kintore.db")
