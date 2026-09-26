@@ -339,6 +339,8 @@ async def sync_badge_roles(member, earned_keys):
         return "error"
     return "ok"
 
+STALL_SESSIONS = 3    # 今日を含めてこの回数、同じ重量が続いたら「重量を上げてみる?」と提案する
+
 #[G0]1種目ぶんの「今日の成長」の1行を作る。prev = db.get_previous_records の戻り値(記録する前の過去最高・前回)
 #  戻り値: (表示する1行, 自己ベストを更新したか)
 def describe_growth(exercise, weight, prev):
@@ -370,17 +372,22 @@ async def shared_kintore(user_id,record_list,member=None):
 #入力 → dbに記録
     cnt= 0
     growth_lines = ""    # 「今日の成長」の文章(1種目1行)
+    suggest_lines = ""   # 同じ重量が続いている種目への、重量アップの提案
     pr_count = 0         # 自己ベストを更新した種目の数
     for exercise,weight in record_list:
         body_part = EXERCISE_BODY_PART.get(exercise, "その他")
         # 過去最高と前回は、記録する「前」に調べる(記録した後だと、今の重量自身が過去最高になってしまうため)
         prev = db.get_previous_records(user_id, exercise, today_str)
+        past_weights = db.get_recent_day_weights(user_id, exercise, today_str, STALL_SESSIONS - 1)   # 今日より前の、直近の重量
         db.insert_kintore(user_id, body_part, exercise, weight, DEFO_SETS, str(datetime.now()))
         cnt += 1
         line, is_pr = describe_growth(exercise, weight, prev)
         growth_lines += line
         if is_pr:
             pr_count += 1
+        # 今日を含めて STALL_SESSIONS 回、同じ重量が続いていたら、次回の重量アップを提案する
+        elif len(past_weights) == STALL_SESSIONS - 1 and all(w == weight for w in past_weights):
+            suggest_lines += f"💡 {exercise} は{STALL_SESSIONS}回続けて{weight:g}kg。次は{weight + WEIGHT_STEP:g}kgに挑戦する？\n"
 #画像ランダム送信イベ
     img_f = glob.glob("images/*")
     found_names = {row[0] for row in db.get_imgText(user_id)}    # 発見済みの画像名の集まり(set)
@@ -452,7 +459,7 @@ async def shared_kintore(user_id,record_list,member=None):
             if role_result == "no_permission" and any(a[0] in BADGE_ROLES for a in new_badges):
                 badge_text += "（部位マスターのロールを自動で付けるには、Botに「ロールの管理」権限が必要です）\n"
 
-    text = f"{badge_prefix}{cnt}種目記録しました！お疲れ様でした💪\n\n📈 今日の成長\n{growth_lines}{summary}\n{xp_text}\n{badge_text}\n{img_text}\n{streak_text}"
+    text = f"{badge_prefix}{cnt}種目記録しました！お疲れ様でした💪\n\n📈 今日の成長\n{growth_lines}{summary}{suggest_lines}\n{xp_text}\n{badge_text}\n{img_text}\n{streak_text}"
     return text , img_ph
 
 #=========================================================================================================
@@ -1561,10 +1568,100 @@ async def roll_dice(message):
     for _ in range(5):                              # 5回、ランダムな目に書き換えて「回転」演出
         await asyncio.sleep(0.3)
         fake = random.choice(DICE_FACES)
-        await msg.edit(content=f"🎲 {fake}")
+        await msg.edit(content=f"# 🎲 {fake}")      # 回転中だけ見出し記法(#)で大きく見せる
     await asyncio.sleep(0.3)
     result = random.randint(1, 6)
-    await msg.edit(content=f"🎲 出た目: {DICE_FACES[result - 1]}（{result}）")
+    await msg.edit(content=f"🎲 出た目: {DICE_FACES[result - 1]}（{result}）")   # 結果は普通の大きさ
+
+#⭐️【テスト】③サイコロで進むミニすごろく
+#  今はまだ「見た目のお試し版」。位置はメモリ上の辞書に置くだけなので、botを再起動すると全員0マス目に戻る
+#  本番にするなら: 位置をDBに保存する・マスに応じた本物の筋トレイベントを入れる・複数人対戦にする、などが次のステップ
+SUGOROKU_GOAL = 20
+SUGOROKU_EVENTS = {                 # マス番号: (表示するメッセージ, 進む/戻るマス数)
+    5: ("🎁 ボーナスマス！2マス進む", 2),
+    10: ("💥 罠マス…2マス戻る", -2),
+    15: ("🍀 ラッキー！1マス進む", 1),
+}
+sugoroku_positions = {}             # {user_id: 今いるマス番号}
+
+#盤面を小さいPNG画像で描く(7列×3行、蛇腹状に折り返して21マス並べる。図鑑のmake_zukan_sheetと同じPillowの使い方)
+SUGOROKU_COLS = 7
+CELL = 50    # 1マスの一辺(px)
+GAP = 5      # マスとマスのすき間(px)
+
+def make_sugoroku_board(pos):
+    cols = SUGOROKU_COLS
+    rows = -(-((SUGOROKU_GOAL + 1)) // cols)            # 切り上げ割り算(21マス→3行)
+    W = cols * CELL + (cols + 1) * GAP
+    H = rows * CELL + (rows + 1) * GAP
+    img = Image.new("RGB", (W, H), (32, 32, 36))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default(size=16)
+    for i in range(SUGOROKU_GOAL + 1):
+        r, c = divmod(i, cols)
+        if r % 2 == 1:                                   # 偶数行は左→右、奇数行は右→左(蛇腹の折り返し)
+            c = cols - 1 - c
+        x = GAP + c * (CELL + GAP)
+        y = GAP + r * (CELL + GAP)
+        if i == SUGOROKU_GOAL:
+            color = (212, 175, 55)      # ゴール: 金色
+        elif i in SUGOROKU_EVENTS:
+            color = (200, 170, 60)      # イベントマス: 黄色っぽい色
+        elif i == 0:
+            color = (80, 160, 90)       # スタート: 緑
+        else:
+            color = (70, 70, 78)        # 普通のマス: グレー
+        draw.rounded_rectangle((x, y, x + CELL, y + CELL), radius=6, fill=color)
+        draw.text((x + 5, y + 4), str(i), font=font, fill=(255, 255, 255))
+        if i == pos:                                      # 今いるマスに、赤い丸(コマ)を重ねて描く
+            m = CELL / 2
+            r_dot = 14
+            draw.ellipse((x + m - r_dot, y + m - r_dot, x + m + r_dot, y + m + r_dot),
+                         fill=(220, 60, 60), outline=(255, 255, 255), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+async def play_sugoroku(message):
+    uid = message.author.id
+    pos = sugoroku_positions.get(uid, 0)
+    if pos >= SUGOROKU_GOAL:         # 前回ゴールしていたら、次に振った時は最初からにする
+        pos = 0
+    msg = await message.channel.send("🎲 サイコロを振っています…",
+                                      file=discord.File(make_sugoroku_board(pos), filename="sugoroku.png"))
+    for _ in range(4):
+        await asyncio.sleep(0.3)
+        fake = random.choice(DICE_FACES)
+        await msg.edit(content=f"# 🎲 {fake}",      # 回転中だけ見出し記法(#)で大きく見せる
+                        attachments=[discord.File(make_sugoroku_board(pos), filename="sugoroku.png")])
+    await asyncio.sleep(0.3)
+    result = random.randint(1, 6)
+    text = f"🎲 出た目: {DICE_FACES[result - 1]}（{result}）"   # 結果は普通の大きさ
+    target = min(pos + result, SUGOROKU_GOAL)
+    while pos < target:                                  # 1マスずつ進めるアニメーション
+        pos += 1
+        await asyncio.sleep(0.25)
+        await msg.edit(content=text,
+                        attachments=[discord.File(make_sugoroku_board(pos), filename="sugoroku.png")])
+    if pos in SUGOROKU_EVENTS:                          # イベントマスに止まったら、追加でマスを動かす(これも1マスずつ)
+        event_text, delta = SUGOROKU_EVENTS[pos]
+        text += f"\n{event_text}"
+        await asyncio.sleep(0.4)
+        await msg.edit(content=text,
+                        attachments=[discord.File(make_sugoroku_board(pos), filename="sugoroku.png")])
+        new_pos = max(0, min(pos + delta, SUGOROKU_GOAL))
+        step = 1 if delta > 0 else -1
+        while pos != new_pos:
+            pos += step
+            await asyncio.sleep(0.25)
+            await msg.edit(content=text,
+                            attachments=[discord.File(make_sugoroku_board(pos), filename="sugoroku.png")])
+    if pos >= SUGOROKU_GOAL:
+        text += "\n🎉 ゴール！おめでとうございます！(次に振るとまた0マス目からです)"
+    sugoroku_positions[uid] = pos
+    await msg.edit(content=text,
+                    attachments=[discord.File(make_sugoroku_board(pos), filename="sugoroku.png")])
 
 #⭐️レベルに応じた絵文字解放の一覧表示
 #  実際のロール制限(sync_emoji_unlock_role)は一覧からの表示/非表示で反映される。ここではLvに応じて🔒が外れる様子をテキストで見せる
@@ -1698,5 +1795,9 @@ async def on_message(message):
     #⭐️---絵文字解放(レベルに応じて🔒が外れる一覧)---
     elif content_lower.strip() in ("絵文字", "emoji"):
         await send_emoji_unlock_demo(message)
+
+    #⭐️---【テスト】すごろく---
+    elif content_lower.strip() in ("すごろく", "sugoroku"):
+        await play_sugoroku(message)
 
 client.run(TOKEN)
