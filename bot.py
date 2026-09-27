@@ -48,8 +48,8 @@ DEFO_SETS = 5
 XP_PER_EXERCISE = 10       # 種目を1つ記録するごと
 XP_DAILY_BONUS = 20        # その日の最初の記録ボーナス(来た日ボーナス)
 XP_PR_BONUS = 30           # 自己ベストを更新した種目ごと
-XP_STREAK_PER_DAY = 5      # 連続記録ボーナス: 連続日数 × この値(その日の最初の記録の時だけ)
-XP_STREAK_MAX_DAYS = 7     # 連続記録ボーナスの対象にする連続日数の上限(7日 → 最大35XP)
+XP_STREAK_PER_DAY = 10     # 継続ボーナス: 継続日数 × この値(その日の最初の記録の時だけ)
+XP_STREAK_MAX_DAYS = 7     # 継続ボーナスの対象にする継続日数の上限(7日 → 最大70XP)
 # 称号: (必要なレベル, 絵文字, 名前, ロールの色)。レベルが上がると、この順に称号がもらえる
 BADGES = [
     (5,  "🥉", "ブロンズ", 0xcd7f32),
@@ -171,7 +171,7 @@ def level_line(xp):
     lv = level_from_xp(xp)
     base, nxt = xp_for_level(lv), xp_for_level(lv + 1)
     filled = int(10 * (xp - base) / (nxt - base))
-    return f"🎖️ Lv.{lv}  {'▰' * filled}{'▱' * (10 - filled)}  {xp - base}/{nxt - base}XP"
+    return f"🎖️ Lv.{lv}  {'▰' * filled}{'▱' * (10 - filled)}  {xp - base}/{nxt - base}XP（次のLvまで）"
 
 #過去の記録ぶんの経験値を、最初に1回だけ付ける(経験値の機能を入れる前に記録した分も無駄にしないため)
 #  経験値の履歴が1行も無い人だけが対象。必ず「新しい記録を保存する前」に呼ぶ(呼ぶのが後だと、新しい記録が二重に数えられる)
@@ -339,7 +339,7 @@ async def sync_badge_roles(member, earned_keys):
         return "error"
     return "ok"
 
-STALL_SESSIONS = 3    # 今日を含めてこの回数、同じ重量が続いたら「重量を上げてみる?」と提案する
+STALL_SESSIONS = 5    # 今日を含めてこの回数、同じ重量が続いたら「重量upに挑戦する？」と提案する
 
 #[G0]1種目ぶんの「今日の成長」の1行を作る。prev = db.get_previous_records の戻り値(記録する前の過去最高・前回)
 #  戻り値: (表示する1行, 自己ベストを更新したか)
@@ -372,7 +372,6 @@ async def shared_kintore(user_id,record_list,member=None):
 #入力 → dbに記録
     cnt= 0
     growth_lines = ""    # 「今日の成長」の文章(1種目1行)
-    suggest_lines = ""   # 同じ重量が続いている種目への、重量アップの提案
     pr_count = 0         # 自己ベストを更新した種目の数
     for exercise,weight in record_list:
         body_part = EXERCISE_BODY_PART.get(exercise, "その他")
@@ -382,12 +381,12 @@ async def shared_kintore(user_id,record_list,member=None):
         db.insert_kintore(user_id, body_part, exercise, weight, DEFO_SETS, str(datetime.now()))
         cnt += 1
         line, is_pr = describe_growth(exercise, weight, prev)
-        growth_lines += line
         if is_pr:
             pr_count += 1
-        # 今日を含めて STALL_SESSIONS 回、同じ重量が続いていたら、次回の重量アップを提案する
+        # 今日を含めて STALL_SESSIONS 回、同じ重量が続いていたら、その種目の行の後ろに重量アップを提案する
         elif len(past_weights) == STALL_SESSIONS - 1 and all(w == weight for w in past_weights):
-            suggest_lines += f"💡 {exercise} は{STALL_SESSIONS}回続けて{weight:g}kg。次は{weight + WEIGHT_STEP:g}kgに挑戦する？\n"
+            line = line.rstrip("\n") + "　💡 重量upに挑戦する？\n"
+        growth_lines += line
 #画像ランダム送信イベ
     img_f = glob.glob("images/*")
     found_names = {row[0] for row in db.get_imgText(user_id)}    # 発見済みの画像名の集まり(set)
@@ -406,30 +405,32 @@ async def shared_kintore(user_id,record_list,member=None):
     #継続記録
     streak = get_streak_days(user_id)
     streak_text = f"🔥継続{streak}日目！\n" if streak > 0 else ""
-    summary = f"🔥 今日は自己ベスト{pr_count}種目！\n" if pr_count else ""
 
-#経験値(XP): 種目 + 来た日ボーナス(その日の最初の記録) + 自己ベスト + 連続記録ボーナス(その日の最初の記録)
+#経験値(XP): 来た日ボーナス(その日の最初の記録) + 継続ボーナス(その日の最初の記録) + 自己ベスト
     xp_text = ""
     badge_prefix = ""      # 返信の1行目の頭に付ける、今の称号の絵文字
     if cnt > 0:
-        parts = [f"種目{cnt * XP_PER_EXERCISE}"]
-        gain = cnt * XP_PER_EXERCISE
+        parts = []
+        gain = 0
         if not already_today:
             parts.append(f"来た日{XP_DAILY_BONUS}")
             gain += XP_DAILY_BONUS
             streak_xp = XP_STREAK_PER_DAY * min(streak, XP_STREAK_MAX_DAYS)
             if streak_xp > 0:
-                parts.append(f"連続{streak_xp}")
+                parts.append(f"継続{streak_xp}(🔥継続{streak}日目！)")
                 gain += streak_xp
+                streak_text = ""          # XPの内訳に入れたので、下の行には重ねて出さない
         if pr_count > 0:
             parts.append(f"自己ベスト{pr_count * XP_PR_BONUS}")
             gain += pr_count * XP_PR_BONUS
         old_xp = db.get_total_xp(user_id)
-        breakdown = "・".join(parts)                  # 例: "種目50・来た日20・自己ベスト30"
-        db.add_xp(user_id, gain, breakdown, str(datetime.now()))
+        breakdown = "・".join(parts)                  # 例: "来た日20・継続40・自己ベスト30"
+        if gain > 0:                                  # 同じ日の2回目の記録などで、もらえるXPが0の時は加算も表示もしない
+            db.add_xp(user_id, gain, breakdown, str(datetime.now()))
         new_xp = old_xp + gain
         old_lv, new_lv = level_from_xp(old_xp), level_from_xp(new_xp)
-        xp_text = f"⭐ +{gain}XP（{breakdown}）\n{level_line(new_xp)}\n"
+        if gain > 0:
+            xp_text = f"⭐ +{gain}XP（{breakdown}）\n{level_line(new_xp)}\n"
         if new_lv > old_lv:
             xp_text += f"🎉 レベルアップ！ Lv.{old_lv} → Lv.{new_lv}\n"
         old_badge, new_badge = badge_for_level(old_lv), badge_for_level(new_lv)
@@ -459,7 +460,12 @@ async def shared_kintore(user_id,record_list,member=None):
             if role_result == "no_permission" and any(a[0] in BADGE_ROLES for a in new_badges):
                 badge_text += "（部位マスターのロールを自動で付けるには、Botに「ロールの管理」権限が必要です）\n"
 
-    text = f"{badge_prefix}{cnt}種目記録しました！お疲れ様でした💪\n\n📈 今日の成長\n{growth_lines}{summary}{suggest_lines}\n{xp_text}\n{badge_text}\n{img_text}\n{streak_text}"
+    # 区切り線。「今日の成長」「経験値」「勲章」のかたまりを見分けやすくする
+    sep = "=" * 50
+    text = (f"{badge_prefix}{cnt}種目記録しました！お疲れ様でした💪\n\n"
+            f"📈 今日の成長\n{growth_lines}\n"
+            f"{sep}\n{xp_text}\n"
+            f"{sep}\n{badge_text}\n{img_text}\n{streak_text}")
     return text , img_ph
 
 #=========================================================================================================
@@ -1134,7 +1140,7 @@ async def send_profile(message):
         lines.append(f"🔥 継続{streak}日")
     _, _, earned = check_achievements(uid)
     lines.append(f"🏅 勲章 {sum(1 for a in ACHIEVEMENTS if a[0] in earned)}/{len(ACHIEVEMENTS)}（`b` で一覧）")
-    lines.append(f"\n経験値は 種目+{XP_PER_EXERCISE} ／ 来た日+{XP_DAILY_BONUS} ／ 自己ベスト+{XP_PR_BONUS} ／ 連続+{XP_STREAK_PER_DAY}×日数（{XP_STREAK_MAX_DAYS}日まで）で貯まります")
+    lines.append(f"\n経験値は 来た日+{XP_DAILY_BONUS} ／ 自己ベスト+{XP_PR_BONUS} ／ 継続+{XP_STREAK_PER_DAY}×日数（{XP_STREAK_MAX_DAYS}日まで）で貯まります")
     result = await sync_level_role(message.author, lv)      # 称号ロールを今のレベルに合わせておく(権限を付けた直後の反映にもなる)
     if result == "no_permission" and badge:
         lines.append("※ 名前の色の称号ロールを自動で付けるには、Botに「ロールの管理」権限が必要です")
@@ -1554,7 +1560,7 @@ HELP_TEXT = f"""📖 **使い方**
 **■ おまけ**
 連続で記録した日数が表示されます（プランが登録されている曜日だけを数えます。プランが無い曜日は記録が無くても途切れません）。
 自己ベストを更新すると「🏆」が出て、図鑑の**まだ見つけていない画像が必ず1枚**もらえます。
-経験値（XP）は 記録・来た日・自己ベスト・連続記録 で貯まり、レベルが上がると称号（🥉🥈🥇💎👑）と、名前の色のロールがもらえます。
+経験値（XP）は 来た日・自己ベスト・継続記録 で貯まり、レベルが上がると称号（🥉🥈🥇💎👑）と、名前の色のロールがもらえます。
 連続記録・自己ベスト・図鑑などで**勲章**、各部位（胸・背中・脚・肩）を{BODY_MASTER_COUNT}回記録すると「部位マスター」のロールがもらえます。
 
 `h` または `?` … この説明"""
